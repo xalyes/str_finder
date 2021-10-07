@@ -1,5 +1,6 @@
 #include <malloc.h>
 #include <errno.h>
+#include <stdio.h>
 
 #include <iostream>
 
@@ -151,141 +152,158 @@ private:
 class CLogReader
 {
 public:
-    CLogReader() {};
-    ~CLogReader() {};
+    CLogReader()
+        : m_filter(nullptr)
+        , m_filterLength(0)
+        , m_file(nullptr)
+        , m_buffer(nullptr)
+        , m_offset(0)
+    {}
 
-    bool Open();
+    ~CLogReader() = default;
+
+    bool Open(const char* filePath);
     void Close();
 
     bool SetFilter(const char* filter);
     bool GetNextLine(char* buf, const int bufsize);
+
+private:
+    char* m_filter;
+    size_t m_filterLength;
+    FILE* m_file;
+
+    char* m_buffer;
+    size_t m_offset;
 };
+
+bool CLogReader::Open(const char* filePath)
+{
+    if (!fopen_s(&m_file, filePath, "r"))
+        return false;
+}
+
+void CLogReader::Close()
+{
+    fclose(m_file);
+}
 
 bool CLogReader::SetFilter(const char* filter)
 {
-    char states[20] = { 0 };
-    bool stars[20] = { 0 };
-    int f = 0;
-    {
-    size_t i = 0;
-    size_t j = 0;
-    bool star = false;
-    while (filter[i])
-    {
-        if (filter[i] == '*')
-        {
-            star = true;
-            ++i;
-            continue;
-        }
+    size_t len = strlen(filter);
 
-        states[j] = filter[i];
-        if (star)
+    m_filter = static_cast<char*>(malloc(len + 1));
+    if (!m_filter)
+        return false;
+
+    m_filterLength = len;
+
+    size_t copied = 0;
+    bool star = false;
+    for (size_t i = 0; char c = filter[i]; ++i)
+    {
+        if (c == '*')
         {
-            stars[j] = true;
+            if (star)
+            {
+                --m_filterLength;
+                continue;
+            }
+            else
+            {
+                m_filter[copied++] = c;
+                star = true;
+                continue;
+            }
         }
         else
         {
-            stars[j] = false;
+            m_filter[copied++] = c;
+            star = false;
         }
-
-        ++i;
-        ++j;
-        star = false;
     }
-    f = j;
-    }
+    m_filter[copied] = '\0';
 
-    auto move = [&states, &stars](int s[20], char c)
-    {
-        int res[20] = { -1 };
-        size_t i = 0;
-        size_t j = 0;
-        while (s[i] != -1)
-        {
-            if (stars[i])
-            {
-                res[j] = s[i];
-                j++;
-            }
-            else if (c == states[i] || '?' == states[i])
-            {
-                res[j] = states[i+1];
-                j++;
-            }
-
-            i++;
-        }
-
-        
-        for (size_t i = 0; i < 20; ++i)
-        {
-            s[i] = res[i];
-        }
-    };
-
-    const char* str = "aacababababaccvddcfd";
-
-    int currentStates[20] = { -1 };
-    currentStates[0] = states[0];
-
-    size_t i = 0;
-    while (str[i])
-    {
-        move(currentStates, str[i]);
-        ++i;
-    }
-
-    for (size_t i = 0; i < 20; ++i)
-    {
-        if (i == f)
-            return str;
-    }
     return true;
 }
 
 bool CLogReader::GetNextLine(char* buf, const int bufsize)
 {
-    const char* mask = "ab*vd?fd*?";
+    //const char* mask = "ab*vd?fd*";
+    //const char* str = "abacababababaccvdcfd";
 
-    const char* str = "sabacababababaccvdcfdscs";
-
-    Vector<size_t> possibleStates;
-    if (possibleStates.Initialize(50))
+    constexpr auto ChunkSize = 4096;
+    m_buffer = static_cast<char*>(malloc(ChunkSize));
+    if (!m_buffer)
         return false;
 
-    if (possibleStates.PushBack(0))
-        return false;
+    size_t readSize = 0;
 
-    size_t i = 0;
-    bool star = false;
-    while (char c = str[i])
+    readSize = fread_s(m_buffer, ChunkSize, ChunkSize, 1, m_file);
+    if (ferror(m_file))
+        false;
+
+    size_t begin = m_offset;
+
+    while (true)
     {
-        auto statesSize = possibleStates.Size();
-        for (size_t k = 0; k < statesSize; ++k)
+        Vector<size_t> possibleStates;
+        if (possibleStates.Initialize(m_filterLength))
+            return false;
+
+        if (possibleStates.PushBack(0))
+            return false;
+
+        size_t i = begin;
+        while (i != readSize)
         {
-            char filterChar = mask[possibleStates[k]];
-            if (c == filterChar || filterChar == '?')
+            char c = m_buffer[i];
+            if (c == '\r' || c == '\n')
+                break;
+
+            auto statesSize = possibleStates.Size();
+            for (size_t k = 0; k < statesSize; ++k)
             {
-                possibleStates[k]++;
+                char filterChar = m_filter[possibleStates[k]];
+                if (c == filterChar || filterChar == '?')
+                {
+                    possibleStates[k]++;
+                }
+                else if (filterChar == '*')
+                {
+                    if (possibleStates.PushBack(possibleStates[k] + 1))
+                        return false;
+                }
+                else
+                {
+                    possibleStates.Erase(k);
+                }
             }
-            else if (filterChar == '*')
+            ++i;
+        }
+        
+        if (i == readSize)
+        {
+            readSize = 0;
+
+            readSize = fread_s(m_buffer, ChunkSize, ChunkSize, 1, m_file);
+            if (ferror(m_file))
+                false;
+
+            begin = 0;
+            m_offset = 0;
+        }
+
+        for (size_t k = 0; k < possibleStates.Size(); ++k)
+        {
+            if (!m_filter[possibleStates[k]])
             {
-                if (possibleStates.PushBack(possibleStates[k] + 1))
-                    return false;
-            }
-            else
-            {
-                possibleStates.Erase(k);
+                strncpy_s(buf, bufsize, m_buffer, i - begin);
+                m_offset = i + 1;
+                return true;
             }
         }
-        ++i;
-    }
-
-    for (size_t k = 0; k < possibleStates.Size(); ++k)
-    {
-        if (!mask[possibleStates[k]])
-            return true;
+        begin = i + 1;
     }
 
     return false;
