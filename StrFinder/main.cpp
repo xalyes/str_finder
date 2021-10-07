@@ -179,8 +179,10 @@ private:
 
 bool CLogReader::Open(const char* filePath)
 {
-    if (!fopen_s(&m_file, filePath, "r"))
+    if (fopen_s(&m_file, filePath, "r"))
         return false;
+
+    return true;
 }
 
 void CLogReader::Close()
@@ -229,6 +231,12 @@ bool CLogReader::SetFilter(const char* filter)
 
 bool CLogReader::GetNextLine(char* buf, const int bufsize)
 {
+    struct MatchContext
+    {
+        Vector<size_t> possibleStates;
+
+    } context;
+
     //const char* mask = "ab*vd?fd*";
     //const char* str = "abacababababaccvdcfd";
 
@@ -239,7 +247,7 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
 
     size_t readSize = 0;
 
-    readSize = fread_s(m_buffer, ChunkSize, ChunkSize, 1, m_file);
+    readSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
     if (ferror(m_file))
         false;
 
@@ -309,9 +317,24 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
     return false;
 }
 
-int main()
+int main(int argc, char* argv[])
 {
+    if (argc != 3)
+        return -1;
+
     CLogReader reader;
-    std::cout << reader.GetNextLine(nullptr, 0) << std::endl;
+    if (!reader.Open(argv[1]))
+        return -2;
+
+    if (!reader.SetFilter(argv[2]))
+        return -2;
+
+    constexpr auto MaxSize = 4096;
+    char* result = static_cast<char*>(malloc(MaxSize));
+    while (reader.GetNextLine(result, MaxSize))
+    {
+        std::cout << result << std::endl;
+    }
+
     return 0;
 }
