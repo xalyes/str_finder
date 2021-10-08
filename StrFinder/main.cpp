@@ -157,7 +157,9 @@ public:
         , m_filterLength(0)
         , m_file(nullptr)
         , m_buffer(nullptr)
+        , m_bufferSize(0)
         , m_offset(0)
+        , m_readSize(0)
     {}
 
     ~CLogReader() = default;
@@ -171,10 +173,14 @@ public:
 private:
     char* m_filter;
     size_t m_filterLength;
+
     FILE* m_file;
 
     char* m_buffer;
+    size_t m_bufferSize;
+
     size_t m_offset;
+    size_t m_readSize;
 };
 
 bool CLogReader::Open(const char* filePath)
@@ -188,130 +194,149 @@ bool CLogReader::Open(const char* filePath)
 void CLogReader::Close()
 {
     fclose(m_file);
+    free(m_buffer);
+    free(m_filter);
 }
 
 bool CLogReader::SetFilter(const char* filter)
 {
-    size_t len = strlen(filter);
-
-    m_filter = static_cast<char*>(malloc(len + 1));
+    m_filter = _strdup(filter);
     if (!m_filter)
         return false;
 
-    m_filterLength = len;
-
-    size_t copied = 0;
-    bool star = false;
-    for (size_t i = 0; char c = filter[i]; ++i)
-    {
-        if (c == '*')
-        {
-            if (star)
-            {
-                --m_filterLength;
-                continue;
-            }
-            else
-            {
-                m_filter[copied++] = c;
-                star = true;
-                continue;
-            }
-        }
-        else
-        {
-            m_filter[copied++] = c;
-            star = false;
-        }
-    }
-    m_filter[copied] = '\0';
+    m_filterLength = strlen(filter);
 
     return true;
 }
 
 bool CLogReader::GetNextLine(char* buf, const int bufsize)
 {
-    struct MatchContext
-    {
-        Vector<size_t> possibleStates;
-
-    } context;
-
-    //const char* mask = "ab*vd?fd*";
-    //const char* str = "abacababababaccvdcfd";
-
     constexpr auto ChunkSize = 4096;
-    m_buffer = static_cast<char*>(malloc(ChunkSize));
-    if (!m_buffer)
-        return false;
 
-    size_t readSize = 0;
+    static bool firstRead = true;
+    if (firstRead)
+    {
+        m_buffer = static_cast<char*>(malloc(ChunkSize));
+        if (!m_buffer)
+            return false;
+        firstRead = false;
+    }
 
-    readSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
-    if (ferror(m_file))
-        false;
+    if (m_bufferSize == m_readSize)
+    {
+        m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
+        if (ferror(m_file))
+            false;
 
-    size_t begin = m_offset;
+        if (!m_bufferSize)
+            return false;
+
+        m_readSize = 0;
+    }
+
+    size_t begin = m_readSize;
 
     while (true)
     {
-        Vector<size_t> possibleStates;
-        if (possibleStates.Initialize(m_filterLength))
-            return false;
-
-        if (possibleStates.PushBack(0))
-            return false;
-
         size_t i = begin;
-        while (i != readSize)
+        size_t j = 0;
+        long lastStarPos = -1;
+        bool skipMode = false;
+
+        while (i != m_bufferSize && j < m_filterLength)
         {
             char c = m_buffer[i];
-            if (c == '\r' || c == '\n')
-                break;
-
-            auto statesSize = possibleStates.Size();
-            for (size_t k = 0; k < statesSize; ++k)
+            if (c == '\n')
             {
-                char filterChar = m_filter[possibleStates[k]];
-                if (c == filterChar || filterChar == '?')
+                skipMode = false;
+                break;
+            }
+
+            if (skipMode)
+            {
+                ++i;
+                continue;
+            }
+
+            if (m_filter[j] == '*')
+            {
+                lastStarPos = j++;
+                continue;
+            }
+
+            if (c == m_filter[j])
+            {
+                j++;
+            }
+            else
+            {
+                if (lastStarPos != -1)
                 {
-                    possibleStates[k]++;
-                }
-                else if (filterChar == '*')
-                {
-                    if (possibleStates.PushBack(possibleStates[k] + 1))
-                        return false;
+                    j = lastStarPos + 1;
                 }
                 else
                 {
-                    possibleStates.Erase(k);
+                    skipMode = true;
+                    continue;
                 }
             }
             ++i;
         }
-        
-        if (i == readSize)
-        {
-            readSize = 0;
 
-            readSize = fread_s(m_buffer, ChunkSize, ChunkSize, 1, m_file);
+        if (i == m_bufferSize)
+        {
+            m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
             if (ferror(m_file))
                 false;
 
+            if (!m_bufferSize)
+                return false;
+
+            m_readSize = 0;
+
             begin = 0;
-            m_offset = 0;
+            continue;
         }
 
-        for (size_t k = 0; k < possibleStates.Size(); ++k)
+        if (m_buffer[i] == '\n')
         {
-            if (!m_filter[possibleStates[k]])
+            if (j == m_filterLength)
             {
-                strncpy_s(buf, bufsize, m_buffer, i - begin);
-                m_offset = i + 1;
+                strncpy_s(buf, bufsize, m_buffer + begin, i - begin);
+                m_readSize = i + 1;
+                return true;
+            }
+
+            if (m_filter[j] == '*')
+            {
+                strncpy_s(buf, bufsize, m_buffer + begin, i - begin);
+                m_readSize = i + 1;
+                return true;
+            }
+            else
+            {
+                begin = i + 1;
+                continue;
+            }
+        }
+        else
+        {
+            if (m_filter[j - 1] != '*')
+            {
+                begin = i + 1;
+                continue;
+            }
+            else
+            {
+                // skip chars to eol
+                for (; m_buffer[i] != '\n'; ++i)
+                {}
+
+                strncpy_s(buf, bufsize, m_buffer + begin, i - begin);
+                m_readSize = i + 1;
                 return true;
             }
         }
-        begin = i + 1;
     }
 
     return false;
@@ -335,6 +360,10 @@ int main(int argc, char* argv[])
     {
         std::cout << result << std::endl;
     }
+
+    free(result);
+    reader.Close();
+
 
     return 0;
 }
