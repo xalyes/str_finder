@@ -192,6 +192,7 @@ public:
         , m_bufferAllocated(false)
         , m_offset(0)
         , m_readSize(0)
+        , eofReached(false)
     {}
 
     ~CLogReader() = default;
@@ -214,6 +215,7 @@ private:
 
     size_t m_offset;
     size_t m_readSize;
+    bool eofReached;
 };
 
 bool CLogReader::Open(const char* filePath)
@@ -246,6 +248,9 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
 {
     constexpr auto ChunkSize = 25;
 
+    if (eofReached)
+        return false;
+
     if (!m_bufferAllocated)
     {
         m_buffer = static_cast<char*>(malloc(ChunkSize));
@@ -260,8 +265,11 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
         if (ferror(m_file))
             false;
 
-        if (!m_bufferSize)
+        if (m_bufferSize != ChunkSize)
+        {
+            eofReached = true;
             return false;
+        }
 
         m_readSize = 0;
     }
@@ -284,8 +292,45 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
 
         while (j < m_filterLength)
         {
+            char c = m_buffer[i];
+            if (c == '\n')
+            {
+                skipMode = false;
+                break;
+            }
+
+            if (!skipMode)
+            {
+                if (m_filter[j] == '*')
+                {
+                    lastStarPos = j++;
+                    continue;
+                }
+
+                if ((c == m_filter[j]) || ('?' == m_filter[j]))
+                {
+                    j++;
+                }
+                else
+                {
+                    if (lastStarPos != -1)
+                    {
+                        j = lastStarPos + 1;
+                    }
+                    else
+                    {
+                        skipMode = true;
+                        continue;
+                    }
+                }
+            }
+            ++i;
+
             if (i >= m_bufferSize)
             {
+                if (eofReached)
+                    break;
+
                 size_t copySize = 0;
 
                 if (i - begin < bufsize)
@@ -313,55 +358,18 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
                     return false;
                 }
 
-                if (!m_bufferSize)
+                if (m_bufferSize != ChunkSize)
                 {
-                    return false;
+                    eofReached = true;
                 }
 
                 m_readSize = 0;
                 begin = 0;
                 i = 0;
             }
-
-            char c = m_buffer[i];
-            if (c == '\n')
-            {
-                skipMode = false;
-                break;
-            }
-
-            if (skipMode)
-            {
-                ++i;
-                continue;
-            }
-
-            if (m_filter[j] == '*')
-            {
-                lastStarPos = j++;
-                continue;
-            }
-
-            if ((c == m_filter[j]) || ('?' == m_filter[j]))
-            {
-                j++;
-            }
-            else
-            {
-                if (lastStarPos != -1)
-                {
-                    j = lastStarPos + 1;
-                }
-                else
-                {
-                    skipMode = true;
-                    continue;
-                }
-            }
-            ++i;
         }
 
-        if (m_buffer[i] == '\n')
+        if (m_buffer[i] == '\n' || eofReached)
         {
             if ((j == m_filterLength) || (j == m_filterLength - 1 && m_filter[j] == '*'))
             {
@@ -394,6 +402,9 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
                 return true;
             }
 
+            if (eofReached)
+                return false;
+
             outputBufferWrittenSize = 0;
             begin = i + 1;
         }
@@ -410,6 +421,9 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
                 {
                     if (i == m_bufferSize)
                     {
+                        if (eofReached)
+                            break;
+
                         size_t copySize = 0;
 
                         if (i - begin < bufsize)
@@ -437,9 +451,9 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
                             return false;
                         }
 
-                        if (!m_bufferSize)
+                        if (m_bufferSize != ChunkSize)
                         {
-                            return false;
+                            eofReached = true;
                         }
 
                         m_readSize = 0;
