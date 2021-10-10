@@ -1,11 +1,11 @@
-#include <iostream>
-
+#include <malloc.h>
 #include "src/c_log_reader.h"
 
-#define TEST
+//#define TEST
 
 #ifdef TEST
 
+#include <iostream>
 #include <vector>
 #include <string>
 #include <map>
@@ -111,6 +111,8 @@ int main()
 
         if (reader.GetNextLine(result, MaxSize))
             std::cout << "Expected false returning but true is returned.\n";
+        else if (reader.GetNextLine(result, MaxSize))
+            std::cout << "GetNextLine returned true after false.\n";
 
         free(result);
         reader.Close();
@@ -138,7 +140,7 @@ int main(int argc, char* argv[])
     char* result = static_cast<char*>(malloc(MaxSize));
     while (reader.GetNextLine(result, MaxSize))
     {
-        std::cout << result << std::endl;
+        printf("%s\n", result);
     }
 
     free(result);

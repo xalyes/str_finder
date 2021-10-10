@@ -1,55 +1,201 @@
 #include <malloc.h>
 #include <string.h>
+#include <new>
 
 #include "c_log_reader.h"
 
-class AutoFreePtr
+// --------------------------------------------------------------------------------
+class ReadContext
 {
 public:
-    AutoFreePtr(void* ptr)
+    ReadContext(size_t chunkSize, FILE* file) noexcept;
+
+    bool CheckedInit() noexcept;
+    bool LoadChunkFromFile() noexcept;
+    bool EofReached() noexcept;
+    ~ReadContext() noexcept;
+
+private:
+    const size_t m_chunkSize;
+    FILE* m_file;
+    bool m_eofReached;
+
+public:
+    char* buffer;
+    size_t bufferSize;
+
+    size_t currentBufferPosition;
+};
+
+// --------------------------------------------------------------------------------
+ReadContext::ReadContext(size_t chunkSize, FILE* file) noexcept
+    : m_chunkSize(chunkSize)
+    , m_file(file)
+    , m_eofReached(false)
+    , buffer(nullptr)
+    , bufferSize(0)
+    , currentBufferPosition(0)
+{}
+
+// --------------------------------------------------------------------------------
+bool ReadContext::CheckedInit() noexcept
+{
+    if (!buffer)
+    {
+        buffer = static_cast<char*>(malloc(m_chunkSize));
+        if (!buffer)
+            return false;
+    }
+    return true;
+}
+
+// --------------------------------------------------------------------------------
+bool ReadContext::LoadChunkFromFile() noexcept
+{
+    bufferSize = fread_s(buffer, m_chunkSize, 1, m_chunkSize, m_file);
+    if (ferror(m_file))
+        return false;
+
+    if (bufferSize != m_chunkSize)
+        m_eofReached = true;
+
+    currentBufferPosition = 0;
+    return true;
+}
+
+// --------------------------------------------------------------------------------
+bool ReadContext::EofReached() noexcept
+{
+    return m_eofReached;
+}
+
+// --------------------------------------------------------------------------------
+ReadContext::~ReadContext() noexcept
+{
+    if (m_file)
+        fclose(m_file);
+
+    free(buffer);
+}
+
+// --------------------------------------------------------------------------------
+class ScopedFree
+{
+public:
+    ScopedFree(void* ptr) noexcept
         : m_ptr(ptr)
     {}
 
-    ~AutoFreePtr()
+    ~ScopedFree() noexcept
     {
         free(m_ptr);
     }
 
-    AutoFreePtr(AutoFreePtr&& other) noexcept
-        : m_ptr(other.m_ptr)
-    {}
-
-    AutoFreePtr& operator =(AutoFreePtr&& other) noexcept
-    {
-        free(m_ptr);
-        m_ptr = other.m_ptr;
-        return *this;
-    }
-
-    AutoFreePtr(const AutoFreePtr&) = delete;
-    AutoFreePtr& operator =(const AutoFreePtr&) = delete;
+    ScopedFree(ScopedFree&& other) = delete;
+    ScopedFree& operator =(ScopedFree&& other) = delete;
+    ScopedFree(const ScopedFree&) = delete;
+    ScopedFree& operator =(const ScopedFree&) = delete;
 
 private:
     void* m_ptr;
-
 };
 
-bool CLogReader::Open(const char* filePath)
+// --------------------------------------------------------------------------------
+static bool ExchangeBuffers(size_t bufsize, ReadContext* readContext, char* outputBuffer, size_t& outputBufferWrittenSize, size_t& begin, size_t& end) noexcept
 {
-    if (fopen_s(&m_file, filePath, "r"))
+    size_t copySize = 0;
+
+    if (end - begin < bufsize)
+    {
+        copySize = end - begin;
+    }
+    else
+    {
+        copySize = bufsize - 1;
+    }
+
+    size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
+    if (freeSpace < copySize)
+        copySize = freeSpace;
+
+    if (copySize > 0)
+    {
+        if (strncpy_s(outputBuffer + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, readContext->buffer + begin, copySize))
+            return false;
+
+        outputBufferWrittenSize += copySize;
+    }
+
+    if (!readContext->LoadChunkFromFile())
         return false;
+
+    begin = 0;
+    end = 0;
+    return true;
+}
+
+// --------------------------------------------------------------------------------
+static bool FillResult(char* buf, size_t bufsize, ReadContext* readContext, char* outputBuffer, size_t outputBufferWrittenSize, size_t begin, size_t end) noexcept
+{
+    if (outputBufferWrittenSize)
+    {
+        if (strncpy_s(buf, bufsize, outputBuffer, outputBufferWrittenSize))
+            return false;
+    }
+
+    size_t copySize = 0;
+
+    if (end - begin < bufsize)
+    {
+        copySize = end - begin;
+    }
+    else
+    {
+        copySize = bufsize - 1;
+    }
+
+    size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
+    if (freeSpace < copySize)
+        copySize = freeSpace;
+
+    if (copySize > 0)
+    {
+        if (strncpy_s(buf + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, readContext->buffer + begin, copySize))
+            return false;
+    }
+
+    readContext->currentBufferPosition = end + 1;
+    return true;
+}
+
+// --------------------------------------------------------------------------------
+bool CLogReader::Open(const char* filePath) noexcept
+{
+    FILE* file;
+    if (fopen_s(&file, filePath, "r"))
+        return false;
+
+    m_readContext = static_cast<ReadContext*>(malloc(sizeof(ReadContext)));
+    if (!m_readContext)
+        return false;
+
+    constexpr auto ChunkSize = 25;
+    new (m_readContext) ReadContext(ChunkSize, file);
 
     return true;
 }
 
-void CLogReader::Close()
+// --------------------------------------------------------------------------------
+void CLogReader::Close() noexcept
 {
-    fclose(m_file);
-    free(m_buffer);
+    m_readContext->~ReadContext();
+    free(m_readContext);
+
     free(m_filter);
 }
 
-bool CLogReader::SetFilter(const char* filter)
+// --------------------------------------------------------------------------------
+bool CLogReader::SetFilter(const char* filter) noexcept
 {
     m_filter = _strdup(filter);
     if (!m_filter)
@@ -60,55 +206,54 @@ bool CLogReader::SetFilter(const char* filter)
     return true;
 }
 
-bool CLogReader::GetNextLine(char* buf, const int bufsize)
+// --------------------------------------------------------------------------------
+bool CLogReader::GetNextLine(char* buf, const int bufsize) noexcept
 {
-    constexpr auto ChunkSize = 25;
-
-    if (eofReached)
+    // Check end of file
+    if (m_readContext->EofReached())
         return false;
 
-    if (!m_bufferAllocated)
+    // Init read context if need
+    if (!m_readContext->CheckedInit())
+        return false;
+
+    // Load the next chunk from file if need
+    if (m_readContext->bufferSize == m_readContext->currentBufferPosition)
     {
-        m_buffer = static_cast<char*>(malloc(ChunkSize));
-        if (!m_buffer)
+        if (!m_readContext->LoadChunkFromFile())
             return false;
-        m_bufferAllocated = true;
     }
 
-    if (m_bufferSize == m_readSize)
-    {
-        m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
-        if (ferror(m_file))
-            false;
-
-        if (m_bufferSize != ChunkSize)
-        {
-            eofReached = true;
-            return false;
-        }
-
-        m_readSize = 0;
-    }
-
-    size_t outputBufferWrittenSize = 0;
+    // Allocate output buffer
     char* outputBuffer = static_cast<char*>(malloc(bufsize));
     if (!outputBuffer)
         return false;
 
-    AutoFreePtr autoFreePtr(outputBuffer);
+    ScopedFree autoFreePtr(outputBuffer);
 
-    size_t begin = m_readSize;
+    size_t outputBufferWrittenSize = 0;
+    size_t begin = m_readContext->currentBufferPosition;
+
+    // Handy wrappers
+    auto exchangeBuffers = [&](size_t& i)
+    {
+        return ExchangeBuffers(bufsize, m_readContext, outputBuffer, outputBufferWrittenSize, begin, i);
+    };
+    auto fillResult = [&](size_t i)
+    {
+        return FillResult(buf, bufsize, m_readContext, outputBuffer, outputBufferWrittenSize, begin, i);
+    };
 
     while (true)
     {
         size_t i = begin;
-        size_t j = 0;
+        size_t filterPos = 0;
         long lastStarPos = -1;
         bool skipMode = false;
 
-        while (j < m_filterLength)
+        while (filterPos < m_filterLength)
         {
-            char c = m_buffer[i];
+            char c = m_readContext->buffer[i];
             if (c == '\n')
             {
                 skipMode = false;
@@ -117,21 +262,21 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
 
             if (!skipMode)
             {
-                if (m_filter[j] == '*')
+                if (m_filter[filterPos] == '*')
                 {
-                    lastStarPos = j++;
+                    lastStarPos = filterPos++;
                     continue;
                 }
 
-                if ((c == m_filter[j]) || ('?' == m_filter[j]))
+                if ((c == m_filter[filterPos]) || ('?' == m_filter[filterPos]))
                 {
-                    j++;
+                    filterPos++;
                 }
                 else
                 {
                     if (lastStarPos != -1)
                     {
-                        j = lastStarPos + 1;
+                        filterPos = lastStarPos + 1;
                     }
                     else
                     {
@@ -142,83 +287,23 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
             }
             ++i;
 
-            if (i >= m_bufferSize)
+            if (i >= m_readContext->bufferSize)
             {
-                if (eofReached)
+                if (m_readContext->EofReached())
                     break;
 
-                size_t copySize = 0;
-
-                if (i - begin < bufsize)
-                {
-                    copySize = i - begin;
-                }
-                else
-                {
-                    copySize = bufsize - 1;
-                }
-
-                size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
-                if (freeSpace < copySize)
-                    copySize = freeSpace;
-
-                if (copySize > 0)
-                {
-                    strncpy_s(outputBuffer + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
-                    outputBufferWrittenSize += copySize;
-                }
-
-                m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
-                if (ferror(m_file))
-                {
+                if (!exchangeBuffers(i))
                     return false;
-                }
-
-                if (m_bufferSize != ChunkSize)
-                {
-                    eofReached = true;
-                }
-
-                m_readSize = 0;
-                begin = 0;
-                i = 0;
             }
         }
 
-        if (m_buffer[i] == '\n' || eofReached)
+        if (m_readContext->buffer[i] == '\n' || m_readContext->EofReached())
         {
-            if ((j == m_filterLength) || (j == m_filterLength - 1 && m_filter[j] == '*'))
-            {
-                if (outputBufferWrittenSize)
-                {
-                    strncpy_s(buf, bufsize, outputBuffer, outputBufferWrittenSize);
-                }
+            // Matching are ok if we passed through the all chars of filter or if the last char is '*'
+            if ((filterPos == m_filterLength) || (filterPos == m_filterLength - 1 && m_filter[filterPos] == '*'))
+                return fillResult(i);
 
-                size_t copySize = 0;
-
-                if (i - begin < bufsize)
-                {
-                    copySize = i - begin;
-                }
-                else
-                {
-                    copySize = bufsize - 1;
-                }
-
-                size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
-                if (freeSpace < copySize)
-                    copySize = freeSpace;
-
-                if (copySize > 0)
-                {
-                    strncpy_s(buf + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
-                }
-
-                m_readSize = i + 1;
-                return true;
-            }
-
-            if (eofReached)
+            if (m_readContext->EofReached())
                 return false;
 
             outputBufferWrittenSize = 0;
@@ -226,55 +311,18 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
         }
         else
         {
-            if (m_filter[j - 1] != '*')
+            if (m_filter[filterPos - 1] == '*')
             {
-                begin = i + 1;
-            }
-            else
-            {
-                // skip chars to eol
-                while (m_buffer[i] != '\n')
+                // skip chars to EOL or EOF
+                while (m_readContext->buffer[i] != '\n')
                 {
-                    if (i == m_bufferSize)
+                    if (i == m_readContext->bufferSize)
                     {
-                        if (eofReached)
+                        if (m_readContext->EofReached())
                             break;
 
-                        size_t copySize = 0;
-
-                        if (i - begin < bufsize)
-                        {
-                            copySize = i - begin;
-                        }
-                        else
-                        {
-                            copySize = bufsize - 1;
-                        }
-
-                        size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
-                        if (freeSpace < copySize)
-                            copySize = freeSpace;
-
-                        if (copySize > 0)
-                        {
-                            strncpy_s(outputBuffer + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
-                            outputBufferWrittenSize += copySize;
-                        }
-
-                        m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
-                        if (ferror(m_file))
-                        {
+                        if (!exchangeBuffers(i))
                             return false;
-                        }
-
-                        if (m_bufferSize != ChunkSize)
-                        {
-                            eofReached = true;
-                        }
-
-                        m_readSize = 0;
-                        begin = 0;
-                        i = 0;
                     }
                     else
                     {
@@ -282,32 +330,11 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
                     }
                 }
 
-                if (outputBufferWrittenSize)
-                {
-                    strncpy_s(buf, bufsize, outputBuffer, outputBufferWrittenSize);
-                }
-
-                size_t copySize = 0;
-
-                if (i - begin < bufsize)
-                {
-                    copySize = i - begin;
-                }
-                else
-                {
-                    copySize = bufsize - 1;
-                }
-
-                size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
-                if (freeSpace < copySize)
-                    copySize = freeSpace;
-
-                if (copySize > 0)
-                {
-                    strncpy_s(buf + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
-                }
-                m_readSize = i + 1;
-                return true;
+                return fillResult(i);
+            }
+            else
+            {
+                begin = i + 1;
             }
         }
     }
