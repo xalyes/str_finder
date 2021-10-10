@@ -149,6 +149,37 @@ private:
     bool m_inited{ false };
 };
 
+class AutoFreePtr
+{
+public:
+    AutoFreePtr(void* ptr)
+        : m_ptr(ptr)
+    {}
+
+    ~AutoFreePtr()
+    {
+        free(m_ptr);
+    }
+
+    AutoFreePtr(AutoFreePtr&& other) noexcept
+        : m_ptr(other.m_ptr)
+    {}
+
+    AutoFreePtr& operator =(AutoFreePtr&& other) noexcept
+    {
+        free(m_ptr);
+        m_ptr = other.m_ptr;
+        return *this;
+    }
+
+    AutoFreePtr(const AutoFreePtr&) = delete;
+    AutoFreePtr& operator =(const AutoFreePtr&) = delete;
+
+private:
+    void* m_ptr;
+
+};
+
 class CLogReader
 {
 public:
@@ -158,6 +189,7 @@ public:
         , m_file(nullptr)
         , m_buffer(nullptr)
         , m_bufferSize(0)
+        , m_bufferAllocated(false)
         , m_offset(0)
         , m_readSize(0)
     {}
@@ -178,6 +210,7 @@ private:
 
     char* m_buffer;
     size_t m_bufferSize;
+    bool m_bufferAllocated;
 
     size_t m_offset;
     size_t m_readSize;
@@ -211,15 +244,14 @@ bool CLogReader::SetFilter(const char* filter)
 
 bool CLogReader::GetNextLine(char* buf, const int bufsize)
 {
-    constexpr auto ChunkSize = 4096;
+    constexpr auto ChunkSize = 25;
 
-    static bool firstRead = true;
-    if (firstRead)
+    if (!m_bufferAllocated)
     {
         m_buffer = static_cast<char*>(malloc(ChunkSize));
         if (!m_buffer)
             return false;
-        firstRead = false;
+        m_bufferAllocated = true;
     }
 
     if (m_bufferSize == m_readSize)
@@ -234,6 +266,13 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
         m_readSize = 0;
     }
 
+    size_t outputBufferWrittenSize = 0;
+    char* outputBuffer = static_cast<char*>(malloc(bufsize));
+    if (!outputBuffer)
+        return false;
+
+    AutoFreePtr autoFreePtr(outputBuffer);
+
     size_t begin = m_readSize;
 
     while (true)
@@ -243,8 +282,47 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
         long lastStarPos = -1;
         bool skipMode = false;
 
-        while (i != m_bufferSize && j < m_filterLength)
+        while (j < m_filterLength)
         {
+            if (i >= m_bufferSize)
+            {
+                size_t copySize = 0;
+
+                if (i - begin < bufsize)
+                {
+                    copySize = i - begin;
+                }
+                else
+                {
+                    copySize = bufsize - 1;
+                }
+
+                size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
+                if (freeSpace < copySize)
+                    copySize = freeSpace;
+
+                if (copySize > 0)
+                {
+                    strncpy_s(outputBuffer + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
+                    outputBufferWrittenSize += copySize;
+                }
+
+                m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
+                if (ferror(m_file))
+                {
+                    return false;
+                }
+
+                if (!m_bufferSize)
+                {
+                    return false;
+                }
+
+                m_readSize = 0;
+                begin = 0;
+                i = 0;
+            }
+
             char c = m_buffer[i];
             if (c == '\n')
             {
@@ -264,7 +342,7 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
                 continue;
             }
 
-            if (c == m_filter[j])
+            if ((c == m_filter[j]) || ('?' == m_filter[j]))
             {
                 j++;
             }
@@ -283,56 +361,121 @@ bool CLogReader::GetNextLine(char* buf, const int bufsize)
             ++i;
         }
 
-        if (i == m_bufferSize)
-        {
-            m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
-            if (ferror(m_file))
-                false;
-
-            if (!m_bufferSize)
-                return false;
-
-            m_readSize = 0;
-
-            begin = 0;
-            continue;
-        }
-
         if (m_buffer[i] == '\n')
         {
-            if (j == m_filterLength)
+            if ((j == m_filterLength) || (j == m_filterLength - 1 && m_filter[j] == '*'))
             {
-                strncpy_s(buf, bufsize, m_buffer + begin, i - begin);
+                if (outputBufferWrittenSize)
+                {
+                    strncpy_s(buf, bufsize, outputBuffer, outputBufferWrittenSize);
+                }
+
+                size_t copySize = 0;
+
+                if (i - begin < bufsize)
+                {
+                    copySize = i - begin;
+                }
+                else
+                {
+                    copySize = bufsize - 1;
+                }
+
+                size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
+                if (freeSpace < copySize)
+                    copySize = freeSpace;
+
+                if (copySize > 0)
+                {
+                    strncpy_s(buf + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
+                }
+
                 m_readSize = i + 1;
                 return true;
             }
 
-            if (m_filter[j] == '*')
-            {
-                strncpy_s(buf, bufsize, m_buffer + begin, i - begin);
-                m_readSize = i + 1;
-                return true;
-            }
-            else
-            {
-                begin = i + 1;
-                continue;
-            }
+            outputBufferWrittenSize = 0;
+            begin = i + 1;
         }
         else
         {
             if (m_filter[j - 1] != '*')
             {
                 begin = i + 1;
-                continue;
             }
             else
             {
                 // skip chars to eol
-                for (; m_buffer[i] != '\n'; ++i)
-                {}
+                while (m_buffer[i] != '\n')
+                {
+                    if (i == m_bufferSize)
+                    {
+                        size_t copySize = 0;
 
-                strncpy_s(buf, bufsize, m_buffer + begin, i - begin);
+                        if (i - begin < bufsize)
+                        {
+                            copySize = i - begin;
+                        }
+                        else
+                        {
+                            copySize = bufsize - 1;
+                        }
+
+                        size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
+                        if (freeSpace < copySize)
+                            copySize = freeSpace;
+
+                        if (copySize > 0)
+                        {
+                            strncpy_s(outputBuffer + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
+                            outputBufferWrittenSize += copySize;
+                        }
+
+                        m_bufferSize = fread_s(m_buffer, ChunkSize, 1, ChunkSize, m_file);
+                        if (ferror(m_file))
+                        {
+                            return false;
+                        }
+
+                        if (!m_bufferSize)
+                        {
+                            return false;
+                        }
+
+                        m_readSize = 0;
+                        begin = 0;
+                        i = 0;
+                    }
+                    else
+                    {
+                        ++i;
+                    }
+                }
+
+                if (outputBufferWrittenSize)
+                {
+                    strncpy_s(buf, bufsize, outputBuffer, outputBufferWrittenSize);
+                }
+
+                size_t copySize = 0;
+
+                if (i - begin < bufsize)
+                {
+                    copySize = i - begin;
+                }
+                else
+                {
+                    copySize = bufsize - 1;
+                }
+
+                size_t freeSpace = bufsize - outputBufferWrittenSize - 1;
+                if (freeSpace < copySize)
+                    copySize = freeSpace;
+
+                if (copySize > 0)
+                {
+                    strncpy_s(buf + outputBufferWrittenSize, bufsize - outputBufferWrittenSize, m_buffer + begin, copySize);
+                }
                 m_readSize = i + 1;
                 return true;
             }
@@ -354,7 +497,7 @@ int main(int argc, char* argv[])
     if (!reader.SetFilter(argv[2]))
         return -2;
 
-    constexpr auto MaxSize = 4096;
+    constexpr auto MaxSize = 50;
     char* result = static_cast<char*>(malloc(MaxSize));
     while (reader.GetNextLine(result, MaxSize))
     {
@@ -363,7 +506,6 @@ int main(int argc, char* argv[])
 
     free(result);
     reader.Close();
-
 
     return 0;
 }
